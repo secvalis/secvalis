@@ -1,0 +1,6 @@
+# Secvalis agent release keys. Verify with:
+#   ssh-keygen -Y verify -f allowed_signers -I release@secvalis.eu -n secvalis-agent -s secvalis.sh.sig < secvalis.sh
+# daily key, SHA256:DQVo2XI/gJ6cBSV3AdiLgSrLnSJkcYWyJlJfZ9Qsim0
+release@secvalis.eu namespaces="secvalis-agent" sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIHREKjfRUhMIaatJDCnlw2f/6FJ8RhXNUxAzrC90lcmHAAAAFHNzaDpzZWN2YWxpcy1yZWxlYXNl
+# backup key, SHA256:nYvBQ9GeKOglNKXjn/nDpzQ1pH/cZgXL+Yx/ybM0sfU
+release@secvalis.eu namespaces="secvalis-agent" sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIOOtqVlq0uOns5h0z5zW7D/fvDKiFEfuJu53jN16xEsHAAAAEnNzaDpzZWN2YWxpcy1iYWt1cA==

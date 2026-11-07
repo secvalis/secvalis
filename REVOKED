@@ -1,0 +1,3 @@
+# Revoked Secvalis agent versions. Do not run a version listed here, even if its signature verifies.
+# Format: <version> <YYYY-MM-DD> <reason>
+# Check a version (no output = not revoked): grep -E '^1\.4\.3 ' REVOKED
