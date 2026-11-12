@@ -6,6 +6,15 @@
 # --no-hostname:  do NOT transmit the machine's real hostname (data minimisation,
 #                 RODO art. 5(1)(c)). Requires --label so the machine still has an
 #                 identity in the UI. The real hostname never leaves the host.
+# --trivy-mirror=<url>: on-prem instance without internet. Trivy binary and its
+#                 databases come from <url> (the instance's /trivy/ path), the binary
+#                 is verified against the same pinned checksum, and Trivy never
+#                 updates its databases itself. No request goes to GitHub or ghcr.io.
+# --cacert=<path>: CA bundle for HTTPS to the instance and the mirror (CURL_CA_BUNDLE).
+# secvalis.conf:  optional file next to this script, lines KEY=value with keys
+#                 API_URL, TRIVY_MIRROR, CACERT. Parsed line by line, never sourced.
+#                 With this file API_URL is mandatory (no fallback to the SaaS API).
+#                 Flags override the file.
 # --low-priority: run Trivy as a low-impact background scan — nice -n 19 (yields CPU
 #                 to real workload), ionice -c 3 (idle I/O) and GOMAXPROCS capped to
 #                 ~half the vCPUs, so the scan does not peg the CPU on small VMs.
@@ -26,7 +35,7 @@ set -euo pipefail
 readonly API_URL_DEFAULT="https://api.secvalis.eu"
 # Agent version (K06 data provenance) — bump on significant script changes.
 # The server compares it with the latest one (separate "agent lifecycle" task → notify/self-update).
-readonly AGENT_VERSION="1.4.3"
+readonly AGENT_VERSION="1.5.0"
 readonly CURL_TIMEOUT=60           # seconds — timeout for short operations (metadata, info fetch)
 readonly CURL_UPLOAD_TIMEOUT=600   # seconds — payload upload timeout (rootfs JSON can be 50MB+)
 readonly TRIVY_TIMEOUT=1800        # seconds — Trivy scan timeout (30 min; Ubuntu Noble with apt cache = 10-15 min)
@@ -48,6 +57,9 @@ LOW_PRIORITY=false # true = throttle Trivy (nice/ionice/GOMAXPROCS) — low-impa
 TRIVY_NICE=""      # command prefix for Trivy when --low-priority (set in main)
 API_URL="${API_URL_DEFAULT}"
 SCAN_LXC="false"  # false = disabled by default; --scan-lxc enables; auto = detect Proxmox
+TRIVY_MIRROR=""   # on-prem: base URL serving the Trivy binary and DBs; empty = upstream (SaaS)
+CACERT=""         # on-prem: CA bundle path for curl to the instance and the mirror
+TRIVY_DB_CACHE="/var/cache/secvalis/trivy"  # Trivy --cache-dir in mirror mode
 
 # ---------------------------------------------------------------------------
 # Utils
@@ -84,6 +96,31 @@ hostname_to_send() {
 }
 
 # ---------------------------------------------------------------------------
+# Config file (on-prem): KEY=value lines, read as data, never sourced
+# ---------------------------------------------------------------------------
+load_config() {
+  local file="$1"
+  [ -f "${file}" ] || return 0
+  local key value has_api_url=false
+  while IFS='=' read -r key value || [ -n "${key}" ]; do
+    value="${value%$'\r'}"
+    case "${key}" in
+      ''|'#'*) ;;
+      API_URL)      API_URL="${value}"; has_api_url=true ;;
+      TRIVY_MIRROR) TRIVY_MIRROR="${value}" ;;
+      CACERT)       CACERT="${value}" ;;
+      *)            log_warn "Ignoring unknown key in ${file}" ;;
+    esac
+  done < "${file}"
+  # A config file means a self-hosted instance: never fall back to the SaaS API.
+  if [ "${has_api_url}" != true ]; then
+    log_error "${file} has no API_URL line — refusing to fall back to ${API_URL_DEFAULT}"
+    exit 1
+  fi
+  log_info "Config loaded: ${file}"
+}
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 parse_args() {
@@ -103,11 +140,12 @@ parse_args() {
         ;;
       --api-url=*)
         API_URL="${arg#*=}"
-        # Require HTTPS for the API endpoint (does not apply to localhost for testing)
-        if [[ "${API_URL}" != https://* ]] && [[ "${API_URL}" != http://localhost* ]] && [[ "${API_URL}" != http://127.0.0.1* ]]; then
-          log_error "API URL must use HTTPS: ${API_URL}"
-          exit 1
-        fi
+        ;;
+      --trivy-mirror=*)
+        TRIVY_MIRROR="${arg#*=}"
+        ;;
+      --cacert=*)
+        CACERT="${arg#*=}"
         ;;
       --scan-lxc)
         SCAN_LXC=true
@@ -125,6 +163,21 @@ parse_args() {
         ;;
     esac
   done
+
+  # Require HTTPS for the API endpoint (does not apply to localhost for testing).
+  # Checked after flags AND secvalis.conf, so a URL from the file is held to the same rule.
+  if [[ "${API_URL}" != https://* ]] && [[ "${API_URL}" != http://localhost* ]] && [[ "${API_URL}" != http://127.0.0.1* ]]; then
+    log_error "API URL must use HTTPS: ${API_URL}"
+    exit 1
+  fi
+  if [ -n "${TRIVY_MIRROR}" ] && [[ "${TRIVY_MIRROR}" != https://* ]]; then
+    log_error "Trivy mirror URL must use HTTPS: ${TRIVY_MIRROR}"
+    exit 1
+  fi
+  if [ -n "${CACERT}" ] && [ ! -r "${CACERT}" ]; then
+    log_error "CA bundle not readable: ${CACERT}"
+    exit 1
+  fi
 
   # Fallback: API key from the SYSDEVOPS_KEY env var when not passed as a positional argument.
   # For scheduled runs (cron/systemd) the key goes through a sourced file/EnvironmentFile,
@@ -260,7 +313,8 @@ verify_trivy_checksum() {
   local artifact_name="$2"   # file name as listed in the checksums file
 
   local sums_file="${TMPDIR_WORK}/trivy_checksums.txt"
-  local sums_url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt"
+  # $3: checksums URL on the on-prem mirror; the pin below is the same either way.
+  local sums_url="${3:-https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_checksums.txt}"
 
   if ! curl --proto '=https' --tlsv1.2 -fsSL --max-time "${CURL_TIMEOUT}" \
       "${sums_url}" -o "${sums_file}"; then
@@ -326,6 +380,12 @@ install_trivy() {
 
   log_info "Installing Trivy ${TRIVY_VERSION} (arch: ${trivy_arch})..."
 
+  if [ -n "${TRIVY_MIRROR}" ]; then
+    install_trivy_from_mirror "${trivy_arch}"
+    log_info "Trivy ${TRIVY_VERSION} installed"
+    return 0
+  fi
+
   local distro
   distro=$(detect_distro)
 
@@ -373,6 +433,60 @@ install_trivy() {
   esac
 
   log_info "Trivy ${TRIVY_VERSION} installed"
+}
+
+# ---------------------------------------------------------------------------
+# On-prem Trivy mirror (no GitHub, no ghcr.io)
+# ---------------------------------------------------------------------------
+# Mirror layout (onprem/trivy-mirror/refresh.sh): trivy_<ver>_checksums.txt,
+# trivy_<ver>_Linux-<arch>.tar.gz, db.tar.gz, javadb.tar.gz.
+install_trivy_from_mirror() {
+  local trivy_arch="$1"
+  local base="${TRIVY_MIRROR%/}"
+  local tar_name="trivy_${TRIVY_VERSION}_Linux-${trivy_arch}.tar.gz"
+  local tar_file="${TMPDIR_WORK}/trivy.tar.gz"
+  if ! curl --proto '=https' --tlsv1.2 -fsSL --max-time "${CURL_TIMEOUT}" \
+      "${base}/${tar_name}" -o "${tar_file}"; then
+    log_error "Could not download ${base}/${tar_name}"
+    trivy_install_failed
+  fi
+  verify_trivy_checksum "${tar_file}" "${tar_name}" "${base}/trivy_${TRIVY_VERSION}_checksums.txt"
+  tar xz -f "${tar_file}" -C "${TMPDIR_WORK}" trivy
+  install -m 755 "${TMPDIR_WORK}/trivy" /usr/local/bin/trivy
+}
+
+# Downloads the vulnerability DBs into TRIVY_DB_CACHE (Trivy --cache-dir layout:
+# db/, java-db/) and makes every trivy call use them without updating:
+# TRIVY_CACHE_DIR, TRIVY_SKIP_DB_UPDATE, TRIVY_SKIP_JAVA_DB_UPDATE are the env
+# forms of --cache-dir --skip-db-update --skip-java-db-update, so the rootfs,
+# image and LXC scans all get them. -z: re-download only when the mirror copy is newer.
+fetch_trivy_db_from_mirror() {
+  local base="${TRIVY_MIRROR%/}" pair name sub tmp
+  mkdir -p "${TRIVY_DB_CACHE}"
+  for pair in "db.tar.gz:db" "javadb.tar.gz:java-db"; do
+    name="${pair%%:*}"
+    sub="${pair#*:}"
+    tmp="${TMPDIR_WORK}/${name}"
+    if ! curl --proto '=https' --tlsv1.2 -fsSL --max-time "${CURL_UPLOAD_TIMEOUT}" \
+        -z "${TRIVY_DB_CACHE}/${name}" "${base}/${name}" -o "${tmp}"; then
+      log_error "Could not download ${base}/${name} — no scan without a vulnerability DB"
+      exit 1
+    fi
+    if [ -s "${tmp}" ]; then
+      # Extract aside first: a broken archive must not wipe the cached DB.
+      mkdir -p "${TMPDIR_WORK}/${sub}"
+      tar xz -f "${tmp}" -C "${TMPDIR_WORK}/${sub}"
+      rm -rf "${TRIVY_DB_CACHE:?}/${sub}"
+      mv "${TMPDIR_WORK}/${sub}" "${TRIVY_DB_CACHE}/${sub}"
+      mv "${tmp}" "${TRIVY_DB_CACHE}/${name}"
+    fi
+  done
+  export TRIVY_CACHE_DIR="${TRIVY_DB_CACHE}"
+  export TRIVY_SKIP_DB_UPDATE=true
+  export TRIVY_SKIP_JAVA_DB_UPDATE=true
+  # Java artifacts not found in the DB would otherwise be looked up on Maven Central.
+  export TRIVY_OFFLINE_SCAN=true
+  log_info "Trivy DBs from mirror: ${TRIVY_DB_CACHE}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1011,8 +1125,11 @@ main() {
   # a scheduled run silently fails 'trivy not found' despite a working interactive test.
   export PATH="/usr/local/bin:${PATH}"
 
+  load_config "$(cd "$(dirname "$0")" && pwd)/secvalis.conf"
   parse_args "$@"
   setup_tmpdir
+  # curl honours CURL_CA_BUNDLE for every request: instance, mirror, upload.
+  [ -n "${CACERT}" ] && export CURL_CA_BUNDLE="${CACERT}"
 
   # Mitigation: remove the API-key invocation from bash history (when passed as $1).
   # Incomplete (a subshell does not modify the parent history) — kept as good practice.
@@ -1085,6 +1202,7 @@ main() {
   fi
 
   install_trivy
+  [ -n "${TRIVY_MIRROR}" ] && fetch_trivy_db_from_mirror
 
   if [ "${DRY_RUN}" = true ]; then
     do_dry_run "${distro}" "${distro_version}"

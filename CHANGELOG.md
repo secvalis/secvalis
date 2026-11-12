@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.0
+
+- Agent 1.5.0: tryb lustra Trivy dla instancji on-prem
+
 ## 1.4.3
 
 - First signed release. `secvalis.sh` is published with a detached SSH signature
